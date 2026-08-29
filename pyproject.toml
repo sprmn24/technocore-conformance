@@ -1,0 +1,29 @@
+[project]
+name = "technocore-conformance"
+version = "0.1.0"
+description = "Protocol conformance and compatibility test suite for Technocore"
+readme = "README.md"
+authors = [
+    { name = "sprmn24" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=50.0.1",
+    "httpx>=0.28.1",
+    "rich>=15.0.0",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+technocore-conformance = "technocore_conformance:main"
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.5",
+]
