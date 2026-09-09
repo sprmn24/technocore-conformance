@@ -81,3 +81,8 @@ Run lint checks:
 ```bash
 uv run --frozen ruff check .
 ```
+
+## Contributor identity
+
+GitHub: [sprmn24](https://github.com/sprmn24)
+DID: `did:key:z6Mkeon34jGxGkm6tKxLDMhD7zNh6w3KoGTn4FxsyZHeQfXF`
