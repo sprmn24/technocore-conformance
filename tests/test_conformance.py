@@ -968,6 +968,9 @@ def test_scan_exits_inconclusive_when_checks_are_skipped(monkeypatch) -> None:
         "check_signed_post_write",
         "check_signed_nonce_ordering",
         "check_signed_write_replay",
+        "check_room_ownership_claim",
+        "check_owned_room_write_authorization",
+        "check_room_allow_list",
     ]
 
     for name in check_names:
@@ -978,7 +981,7 @@ def test_scan_exits_inconclusive_when_checks_are_skipped(monkeypatch) -> None:
     result = CliRunner().invoke(tc.app, ["https://example.test"])
 
     assert result.exit_code == 2
-    assert "17/18 checks passed, 1 skipped" in result.stdout
+    assert "20/21 checks passed, 1 skipped" in result.stdout
 
 
 def test_scan_failure_takes_precedence_over_skip(monkeypatch) -> None:
@@ -1005,6 +1008,9 @@ def test_scan_failure_takes_precedence_over_skip(monkeypatch) -> None:
         "check_signed_post_write",
         "check_signed_nonce_ordering",
         "check_signed_write_replay",
+        "check_room_ownership_claim",
+        "check_owned_room_write_authorization",
+        "check_room_allow_list",
     ]
 
     for name in check_names:
@@ -1105,3 +1111,485 @@ def test_request_with_rate_limit_does_not_wait_for_large_retry_after(
 
     assert observed.status_code == 429
     assert sleeps == []
+
+
+def test_check_room_ownership_claim(monkeypatch) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    captured = {}
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            did = url.split("/set-signed/")[1].split("/")[0]
+            captured["owner_did"] = did
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        if call_index == 3:
+            return Response(
+                status_code=200,
+                text=captured["owner_did"] + "\n# budget: 7 of 120 reads left this minute\n",
+            )
+        raise AssertionError(f"unexpected extra call: {url}")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_ownership_claim("https://example.test") is True
+
+
+def test_check_room_ownership_claim_rejects_second_claimant_accepted(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            # a buggy server silently accepts a second claimant instead
+            # of rejecting it at the ownership gate
+            return Response(status_code=200)
+        return Response(status_code=200, text="whoever")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_ownership_claim("https://example.test") is False
+
+
+def test_check_room_ownership_claim_rejects_sequential_second_claimant_conflict_status(
+    monkeypatch,
+) -> None:
+    # Regression test: _note_write_gate() for the room-owners namespace runs
+    # before the CAS/if_absent write and short-circuits a sequential second
+    # claimant (different signer, owner already set) with a plain 403 --
+    # the if_absent CAS point is never reached. A 409 here can only mean the
+    # server let the request past the ownership gate, so it must FAIL, not
+    # be accepted as an alternate "conflict" status.
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=409)
+        return Response(status_code=200, text="whoever")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_ownership_claim("https://example.test") is False
+
+
+def test_check_room_ownership_claim_rejects_wrong_stored_owner(monkeypatch) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        # stored owner does not match the first claimant's DID
+        return Response(status_code=200, text="did:key:zSOMEONE-ELSE")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_ownership_claim("https://example.test") is False
+
+
+def test_check_owned_room_write_authorization(monkeypatch) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "error",
+                    request=httpx.Request("GET", "https://example.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, *, timeout, params=None):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=403)
+        return Response(
+            status_code=200, payload={"messages": [{"text": "owner-message"}]}
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_owned_room_write_authorization("https://example.test") is True
+
+
+
+def test_check_owned_room_write_authorization_rejects_leaked_rejected_write(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "error",
+                    request=httpx.Request("GET", "https://example.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, *, timeout, params=None):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=403)
+        return Response(
+            status_code=200,
+            payload={
+                "messages": [
+                    {"text": "owner-message"},
+                    {"text": "intruder-message"},
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_owned_room_write_authorization("https://example.test") is False
+
+
+def test_check_owned_room_write_authorization_rejects_malformed_room_state(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "error",
+                    request=httpx.Request("GET", "https://example.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, *, timeout, params=None):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=403)
+        return Response(status_code=200, payload=["not", "an", "object"])
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_owned_room_write_authorization("https://example.test") is False
+
+
+def test_check_owned_room_write_authorization_rejects_non_list_messages(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "error",
+                    request=httpx.Request("GET", "https://example.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, *, timeout, params=None):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=403)
+        return Response(
+            status_code=200,
+            payload={"messages": {"text": "owner-message"}},
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_owned_room_write_authorization("https://example.test") is False
+
+
+def test_check_owned_room_write_authorization_skips_on_room_creation_budget(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout, params=None):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=403)
+        if call_index == 3:
+            return Response(
+                status_code=429,
+                text="429 room-creation budget spent: 0 remaining",
+            )
+        raise AssertionError(f"unexpected extra call: {url}")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_owned_room_write_authorization("https://example.test") is None
+    assert call_index == 3
+
+def test_check_room_allow_list(monkeypatch) -> None:
+    from urllib.parse import unquote
+
+    import httpx
+
+    import technocore_conformance as tc
+
+    captured = {}
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            captured["guest_did"] = unquote(url.rsplit("/", 1)[-1])
+            return Response(status_code=200)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=403)
+        return Response(
+                status_code=200,
+                text=captured["guest_did"] + "\n# budget: 7 of 120 reads left this minute\n",
+            )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_allow_list("https://example.test") is True
+
+
+def test_check_room_allow_list_rejects_non_owner_write_reported_as_conflict(
+    monkeypatch,
+) -> None:
+    # Regression test: a non-owner allow-list write must be rejected with
+    # exactly 403. These nonces are deterministically increasing and never
+    # produce a genuine CAS conflict here, so a 409 can only mean the
+    # server mishandled authorization.
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=200)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=409)
+        return Response(status_code=200, text="whatever-was-stored")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_allow_list("https://example.test") is False
+
+
+def test_check_room_allow_list_rejects_stale_stored_value(monkeypatch) -> None:
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=200)
+        if call_index == 3:
+            return Response(status_code=200)
+        if call_index == 4:
+            return Response(status_code=403)
+        # buggy server: the allow-list no longer matches the owner's
+        # original grant
+        return Response(status_code=200, text="did:key:zSOMEONE-ELSE")
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_allow_list("https://example.test") is False
+
+
+def test_check_room_allow_list_skips_on_room_creation_budget(monkeypatch) -> None:
+    # The budget check only applies to the first real room *message* write
+    # (guest_write here), never to the room-owners/room-allow KV notes --
+    # neither note write reaches _room_create_gate() upstream.
+    import httpx
+
+    import technocore_conformance as tc
+
+    call_index = 0
+
+    class Response:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    def fake_get(url, *, timeout):
+        nonlocal call_index
+        call_index += 1
+        if call_index == 1:
+            return Response(status_code=200)
+        if call_index == 2:
+            return Response(status_code=200)
+        return Response(
+            status_code=429, text="429 room-creation budget spent: 0 remaining"
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert tc.check_room_allow_list("https://example.test") is None

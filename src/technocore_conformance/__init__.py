@@ -53,6 +53,13 @@ def _request_with_rate_limit(
     raise RuntimeError("unreachable")
 
 
+def _last_value_line(text: str) -> str:
+    lines = text.rstrip("\n").split("\n")
+    while lines and lines[-1].startswith("# budget:"):
+        lines.pop()
+    return lines[-1] if lines else ""
+
+
 def check_endpoint(base_url: str) -> bool:
     try:
         response = _request_with_rate_limit("GET", f"{base_url}/healthz", timeout=10.0)
@@ -967,6 +974,335 @@ def check_signed_write_replay(base_url: str) -> bool | None:
     return True
 
 
+def _signed_note_url(
+    base_url: str,
+    key_obj: Ed25519PrivateKey,
+    ns: str,
+    note_key: str,
+    nonce: str,
+    value: str,
+) -> str:
+    canonical = f"{ns}|{note_key}|{nonce}|{value}"
+    sig = _signature(key_obj, canonical)
+    did = _did_of(key_obj)
+    encoded_value = quote(value, safe="")
+    return (
+        f"{base_url}/kv/{ns}/{note_key}/set-signed/{did}/{sig}/{nonce}/{encoded_value}"
+    )
+
+
+def check_room_ownership_claim(base_url: str) -> bool:
+    room = f"d-conformance-{secrets.token_hex(6)}"
+    owner_key = Ed25519PrivateKey.generate()
+    owner_did = _did_of(owner_key)
+    challenger_key = Ed25519PrivateKey.generate()
+    challenger_did = _did_of(challenger_key)
+
+    base_nonce = time.time_ns() // 1_000_000
+    nonce = str(base_nonce)
+    challenger_nonce = str(base_nonce + 1)
+
+    claim_url = _signed_note_url(
+        base_url, owner_key, "room-owners", room, nonce, owner_did
+    )
+
+    try:
+        claim = _request_with_rate_limit(
+            "GET", claim_url + "?if_absent=1", timeout=10.0
+        )
+    except httpx.HTTPError as exc:
+        console.print(f"[red]FAIL[/red] Room ownership claim: {exc}")
+        return False
+
+    if claim.status_code != 200:
+        console.print(
+            f"[red]FAIL[/red] Room ownership claim: initial claim returned "
+            f"{claim.status_code}, expected 200"
+        )
+        return False
+
+    challenge_url = _signed_note_url(
+        base_url, challenger_key, "room-owners", room, challenger_nonce, challenger_did
+    )
+
+    try:
+        challenge = _request_with_rate_limit(
+            "GET", challenge_url + "?if_absent=1", timeout=10.0
+        )
+        stored = _request_with_rate_limit(
+            "GET", f"{base_url}/kv/room-owners/{room}", timeout=10.0
+        )
+    except httpx.HTTPError as exc:
+        console.print(f"[red]FAIL[/red] Room ownership claim: {exc}")
+        return False
+
+    if challenge.status_code != 403:
+        console.print(
+            f"[red]FAIL[/red] Room ownership claim: a second claimant "
+            f"received {challenge.status_code}, expected 403"
+        )
+        return False
+
+    if stored.status_code != 200:
+        console.print(
+            f"[red]FAIL[/red] Room ownership claim: stored owner lookup "
+            f"returned {stored.status_code}, expected 200"
+        )
+        return False
+
+    stored_owner = _last_value_line(stored.text)
+    if stored_owner != owner_did:
+        console.print(
+            f"[red]FAIL[/red] Room ownership claim: stored owner is "
+            f"{stored_owner!r}, expected the first claimant's DID"
+        )
+        return False
+
+    console.print("[green]PASS[/green] Room ownership claim (first-writer-wins)")
+    return True
+
+
+def check_owned_room_write_authorization(base_url: str) -> bool | None:
+    room = f"d-conformance-{secrets.token_hex(6)}"
+    owner_key = Ed25519PrivateKey.generate()
+    owner_did = _did_of(owner_key)
+    intruder_key = Ed25519PrivateKey.generate()
+    intruder_did = _did_of(intruder_key)
+
+    base_nonce = time.time_ns() // 1_000_000
+    claim_nonce = str(base_nonce)
+    owner_nonce = str(base_nonce + 1)
+    intruder_nonce = str(base_nonce + 2)
+
+    claim_url = _signed_note_url(
+        base_url, owner_key, "room-owners", room, claim_nonce, owner_did
+    )
+
+    try:
+        claim = _request_with_rate_limit(
+            "GET", claim_url + "?if_absent=1", timeout=10.0
+        )
+        if claim.status_code != 200:
+            console.print(
+                f"[red]FAIL[/red] Owned room write authorization: claim "
+                f"returned {claim.status_code}, expected 200"
+            )
+            return False
+
+        unsigned = _request_with_rate_limit(
+            "GET", f"{base_url}/r/{room}/say/plainnick/hello", timeout=10.0
+        )
+
+        owner_canonical = f"{room}|{owner_nonce}|owner-message"
+        owner_sig = _signature(owner_key, owner_canonical)
+        owner_write = _request_with_rate_limit(
+            "GET",
+            f"{base_url}/r/{room}/say-signed/{owner_did}/{owner_sig}/"
+            f"{owner_nonce}/owner-message",
+            timeout=10.0,
+        )
+
+        if getattr(
+            owner_write, "status_code", None
+        ) == 429 and owner_write.text.startswith("429 room-creation budget spent:"):
+            console.print(
+                "[yellow]SKIP[/yellow] Owned room write authorization: "
+                "room-creation budget exhausted"
+            )
+            return None
+
+        intruder_canonical = f"{room}|{intruder_nonce}|intruder-message"
+        intruder_sig = _signature(intruder_key, intruder_canonical)
+        intruder_write = _request_with_rate_limit(
+            "GET",
+            f"{base_url}/r/{room}/say-signed/{intruder_did}/{intruder_sig}/"
+            f"{intruder_nonce}/intruder-message",
+            timeout=10.0,
+        )
+
+        room_state = _request_with_rate_limit(
+            "GET", f"{base_url}/r/{room}", params={"format": "json"}, timeout=10.0
+        )
+        room_state.raise_for_status()
+        room_payload = room_state.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        console.print(f"[red]FAIL[/red] Owned room write authorization: {exc}")
+        return False
+
+    if not isinstance(room_payload, dict):
+        console.print(
+            "[red]FAIL[/red] Owned room write authorization: room state "
+            "payload was not a JSON object"
+        )
+        return False
+
+    messages = room_payload.get("messages")
+    if not isinstance(messages, list):
+        console.print(
+            "[red]FAIL[/red] Owned room write authorization: room state "
+            "'messages' field was not a list"
+        )
+        return False
+
+    texts = [record.get("text") for record in messages if isinstance(record, dict)]
+
+    if unsigned.status_code != 403:
+        console.print(
+            f"[red]FAIL[/red] Owned room write authorization: unsigned "
+            f"write returned {unsigned.status_code}, expected 403"
+        )
+        return False
+
+    if owner_write.status_code != 200:
+        console.print(
+            f"[red]FAIL[/red] Owned room write authorization: owner's "
+            f"signed write returned {owner_write.status_code}, expected 200"
+        )
+        return False
+
+    if intruder_write.status_code != 403:
+        console.print(
+            f"[red]FAIL[/red] Owned room write authorization: an "
+            f"unlisted signer's write returned {intruder_write.status_code}, "
+            f"expected 403"
+        )
+        return False
+
+    if "owner-message" not in texts:
+        console.print(
+            "[red]FAIL[/red] Owned room write authorization: the owner's "
+            "accepted message is missing from the room"
+        )
+        return False
+
+    if "hello" in texts or "intruder-message" in texts:
+        console.print(
+            "[red]FAIL[/red] Owned room write authorization: a rejected "
+            "write left content in the room"
+        )
+        return False
+
+    console.print(
+        "[green]PASS[/green] Owned room write authorization "
+        "(unsigned refused, owner accepted, unlisted signer refused, "
+        "rejected writes left no trace)"
+    )
+    return True
+
+
+def check_room_allow_list(base_url: str) -> bool | None:
+    room = f"d-conformance-{secrets.token_hex(6)}"
+    owner_key = Ed25519PrivateKey.generate()
+    owner_did = _did_of(owner_key)
+    guest_key = Ed25519PrivateKey.generate()
+    guest_did = _did_of(guest_key)
+
+    # room-owners and room-allow signed notes for this room share a single
+    # replay-protection counter, regardless of which key signs them, so
+    # these three nonces must be strictly increasing in this order or a
+    # later step can be rejected as replay rather than for the reason
+    # this check means to exercise.
+    base_nonce = time.time_ns() // 1_000_000
+    claim_nonce = str(base_nonce)
+    allow_nonce = str(base_nonce + 1)
+    guest_allow_nonce = str(base_nonce + 2)
+    guest_message_nonce = str(base_nonce)
+
+    claim_url = _signed_note_url(
+        base_url, owner_key, "room-owners", room, claim_nonce, owner_did
+    )
+
+    try:
+        claim = _request_with_rate_limit(
+            "GET", claim_url + "?if_absent=1", timeout=10.0
+        )
+        if claim.status_code != 200:
+            console.print(
+                f"[red]FAIL[/red] Room allow-list: claim returned "
+                f"{claim.status_code}, expected 200"
+            )
+            return False
+
+        allow_url = _signed_note_url(
+            base_url, owner_key, "room-allow", room, allow_nonce, guest_did
+        )
+        allow_set = _request_with_rate_limit("GET", allow_url, timeout=10.0)
+
+        if allow_set.status_code != 200:
+            console.print(
+                f"[red]FAIL[/red] Room allow-list: owner adding a guest "
+                f"returned {allow_set.status_code}, expected 200"
+            )
+            return False
+
+        guest_canonical = f"{room}|{guest_message_nonce}|guest-message"
+        guest_sig = _signature(guest_key, guest_canonical)
+        guest_write = _request_with_rate_limit(
+            "GET",
+            f"{base_url}/r/{room}/say-signed/{guest_did}/{guest_sig}/"
+            f"{guest_message_nonce}/guest-message",
+            timeout=10.0,
+        )
+
+        if getattr(
+            guest_write, "status_code", None
+        ) == 429 and guest_write.text.startswith("429 room-creation budget spent:"):
+            console.print(
+                "[yellow]SKIP[/yellow] Room allow-list: room-creation budget exhausted"
+            )
+            return None
+
+        if guest_write.status_code != 200:
+            console.print(
+                f"[red]FAIL[/red] Room allow-list: allow-listed guest's "
+                f"write returned {guest_write.status_code}, expected 200"
+            )
+            return False
+
+        guest_allow_url = _signed_note_url(
+            base_url, guest_key, "room-allow", room, guest_allow_nonce, guest_did
+        )
+        guest_modifies_allow = _request_with_rate_limit(
+            "GET", guest_allow_url, timeout=10.0
+        )
+        allow_state = _request_with_rate_limit(
+            "GET", f"{base_url}/kv/room-allow/{room}", timeout=10.0
+        )
+    except httpx.HTTPError as exc:
+        console.print(f"[red]FAIL[/red] Room allow-list: {exc}")
+        return False
+
+    if guest_modifies_allow.status_code != 403:
+        console.print(
+            f"[red]FAIL[/red] Room allow-list: a non-owner allow-listed "
+            f"guest received {guest_modifies_allow.status_code} trying to "
+            f"modify the allow-list, expected 403"
+        )
+        return False
+
+    if allow_state.status_code != 200:
+        console.print(
+            f"[red]FAIL[/red] Room allow-list: allow-list lookup returned "
+            f"{allow_state.status_code}, expected 200"
+        )
+        return False
+
+    allow_value = _last_value_line(allow_state.text)
+    if allow_value != guest_did:
+        console.print(
+            f"[red]FAIL[/red] Room allow-list: stored allow-list is "
+            f"{allow_value!r}, expected it to still read only the "
+            f"owner's original grant"
+        )
+        return False
+
+    console.print(
+        "[green]PASS[/green] Room allow-list "
+        "(owner grants access, allow-list itself stays owner-only)"
+    )
+    return True
+
+
 @app.command()
 def scan(
     endpoint: str = typer.Argument(..., help="Technocore base URL"),
@@ -1017,6 +1353,14 @@ def scan(
                 check_signed_post_write,
                 check_signed_nonce_ordering,
                 check_signed_write_replay,
+            ],
+        ),
+        (
+            "Room ownership",
+            [
+                check_room_ownership_claim,
+                check_owned_room_write_authorization,
+                check_room_allow_list,
             ],
         ),
     ]
