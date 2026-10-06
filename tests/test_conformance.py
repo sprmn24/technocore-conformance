@@ -3,6 +3,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from technocore_conformance import _did_of, _signature
 
 
+def _without_n(params):
+    assert params and "n" in params, "room reads must carry the n cache-buster"
+    return {k: v for k, v in params.items() if k != "n"}
+
+
 def test_did_and_signature_shape() -> None:
     key = Ed25519PrivateKey.generate()
 
@@ -63,7 +68,7 @@ def test_check_post_messaging(monkeypatch) -> None:
     assert calls[0][2]["from"] == "conformance"
     assert calls[0][2]["text"].startswith("hello-post-")
     assert calls[1][0] == "GET"
-    assert calls[1][2] == {"format": "json"}
+    assert _without_n(calls[1][2]) == {"format": "json"}
 
 
 def test_check_since_semantics(monkeypatch) -> None:
@@ -93,10 +98,10 @@ def test_check_since_semantics(monkeypatch) -> None:
 
         read_count += 1
         if read_count == 1:
-            assert params == {"format": "json"}
+            assert _without_n(params) == {"format": "json"}
             return Response({"last_seq": 40})
 
-        assert params == {"since": 40, "format": "json"}
+        assert _without_n(params) == {"since": 40, "format": "json"}
         texts = [url.rsplit("/", 1)[-1] for url in writes]
         return Response(
             {
@@ -141,10 +146,10 @@ def test_check_limit_semantics(monkeypatch) -> None:
 
         read_count += 1
         if read_count == 1:
-            assert params == {"format": "json"}
+            assert _without_n(params) == {"format": "json"}
             return Response({"last_seq": 40})
 
-        assert params == {"limit": 2, "format": "json"}
+        assert _without_n(params) == {"limit": 2, "format": "json"}
         texts = [url.rsplit("/", 1)[-1] for url in writes]
         return Response(
             {
@@ -745,7 +750,7 @@ def test_check_wait_semantics(monkeypatch) -> None:
 
         read_count += 1
         if read_count == 1:
-            assert params == {"format": "json"}
+            assert _without_n(params) == {"format": "json"}
             return Response({"last_seq": 40})
 
         assert params == {"since": 41, "wait": 2, "format": "json"}
@@ -1064,7 +1069,7 @@ def test_check_private_room_enumeration_reuses_shared_room(monkeypatch) -> None:
 
     try:
         assert tc.check_private_room_enumeration("https://example.test") is True
-        assert calls == [
+        assert [(url, _without_n(params)) for url, params in calls] == [
             (
                 "https://example.test/rooms",
                 {"format": "json"},

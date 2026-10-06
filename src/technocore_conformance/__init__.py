@@ -16,6 +16,16 @@ console = Console()
 SHARED_TEST_ROOM = "p-conformance-suite"
 
 
+def _fresh(params: dict) -> dict:
+    """Add the throwaway ``n`` counter manual.md recommends for re-polled URLs.
+
+    Room reads are edge-cacheable (s-maxage plus stale-while-revalidate), so a
+    read-after-write check on a previously fetched URL can be answered from a
+    copy taken before the write.
+    """
+    return {**params, "n": secrets.token_hex(4)}
+
+
 def _request_with_rate_limit(
     method: str,
     url: str,
@@ -167,7 +177,7 @@ def check_messaging(base_url: str) -> bool | None:
         read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         read.raise_for_status()
@@ -213,7 +223,7 @@ def check_since_semantics(base_url: str) -> bool | None:
         baseline_read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         baseline_read.raise_for_status()
@@ -230,7 +240,7 @@ def check_since_semantics(base_url: str) -> bool | None:
         read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"since": baseline, "format": "json"},
+            params=_fresh({"since": baseline, "format": "json"}),
             timeout=10.0,
         )
         read.raise_for_status()
@@ -275,7 +285,7 @@ def check_limit_semantics(base_url: str) -> bool | None:
         baseline_read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         baseline_read.raise_for_status()
@@ -292,7 +302,7 @@ def check_limit_semantics(base_url: str) -> bool | None:
         read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"limit": 2, "format": "json"},
+            params=_fresh({"limit": 2, "format": "json"}),
             timeout=10.0,
         )
         read.raise_for_status()
@@ -338,7 +348,7 @@ def check_wait_semantics(base_url: str) -> bool | None:
         baseline_read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         baseline_read.raise_for_status()
@@ -432,7 +442,7 @@ def check_post_messaging(base_url: str) -> bool | None:
         read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         read.raise_for_status()
@@ -484,7 +494,7 @@ def check_single_line_sanitization(base_url: str) -> bool | None:
         read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         read.raise_for_status()
@@ -525,7 +535,7 @@ def check_private_room_enumeration(base_url: str) -> bool | None:
         rooms = _request_with_rate_limit(
             "GET",
             f"{base_url}/rooms",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         rooms.raise_for_status()
@@ -762,7 +772,7 @@ def check_signed_post_write(base_url: str) -> bool | None:
         read = _request_with_rate_limit(
             "GET",
             f"{base_url}/r/{room}",
-            params={"format": "json"},
+            params=_fresh({"format": "json"}),
             timeout=10.0,
         )
         read.raise_for_status()
@@ -1121,7 +1131,10 @@ def check_owned_room_write_authorization(base_url: str) -> bool | None:
         )
 
         room_state = _request_with_rate_limit(
-            "GET", f"{base_url}/r/{room}", params={"format": "json"}, timeout=10.0
+            "GET",
+            f"{base_url}/r/{room}",
+            params=_fresh({"format": "json"}),
+            timeout=10.0,
         )
         room_state.raise_for_status()
         room_payload = room_state.json()
